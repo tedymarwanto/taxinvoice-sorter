@@ -5,23 +5,44 @@ import multiprocessing
 import os
 import time
 import re
+import json
+import hashlib
 from pypdf import PdfReader, PdfWriter
 import pandas as pd
 
+S3M_PATTERN = re.compile(r'S3M\d+')
+CACHE_DIR = os.path.expanduser("~/.tax_invoice_sorter_cache")
+
+def get_pdf_hash(pdf_path):
+    stat = os.stat(pdf_path)
+    key = f"{pdf_path}|{stat.st_size}|{stat.st_mtime}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+def load_cache(pdf_hash):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, f"{pdf_hash}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+def save_cache(pdf_hash, data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, f"{pdf_hash}.json")
+    with open(cache_file, "w") as f:
+        json.dump(data, f)
+
 def _scan_chunk(args):
-    pdf_path, page_indices, invoice_set = args
+    pdf_path, page_indices = args
     reader = PdfReader(pdf_path)
     results = {}
-    pattern = re.compile(r'S3M\d+')
     for i in page_indices:
         text = (reader.pages[i].extract_text() or "").upper()
-        found_excel = None
-        for inv in invoice_set:
-            if inv in text:
-                found_excel = inv
-                break
-        all_s3m = pattern.findall(text)
-        results[i] = (found_excel, len(all_s3m) > 0)
+        all_s3m = S3M_PATTERN.findall(text)
+        results[str(i)] = all_s3m
     return results
 
 def get_excel_columns(excel_path):
@@ -42,71 +63,81 @@ def extract_invoice_numbers_from_excel(excel_path, column_name):
             unique.append(inv)
     return unique
 
-def scan_and_build(pdf_path, invoice_list, output_path, progress_cb=None):
-    invoice_set = set(inv.upper() for inv in invoice_list)
+def scan_pdf(pdf_path, progress_cb=None):
+    """Scan PDF, return page_data. Pakai cache kalau ada."""
+    pdf_hash = get_pdf_hash(pdf_path)
+    cached = load_cache(pdf_hash)
+    if cached:
+        if progress_cb:
+            progress_cb(70, 100, "Cache ditemukan! Skip scanning...")
+        return cached, True
 
     reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
 
     num_workers = min(multiprocessing.cpu_count(), 8)
-    chunk_size  = max(1, total_pages // num_workers)
+    chunk_size  = max(1, total_pages // (num_workers * 4))
     chunks = [list(range(i, min(i + chunk_size, total_pages)))
               for i in range(0, total_pages, chunk_size)]
 
-    args_list = [(pdf_path, chunk, invoice_set) for chunk in chunks]
-
-    # page_data[i] = (invoice_key_or_None, has_any_s3m)
+    args_list = [(pdf_path, chunk) for chunk in chunks]
     page_data = {}
-    completed = 0
+    chunks_done = 0
 
     if progress_cb:
-        progress_cb(0, total_pages, f"Menyiapkan {num_workers} core CPU...")
+        progress_cb(0, 100, f"Scanning PDF dengan {num_workers} core CPU... (0%)")
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         for chunk_result in pool.imap_unordered(_scan_chunk, args_list):
             page_data.update(chunk_result)
-            completed += chunk_size
+            chunks_done += 1
+            pages_done = min(chunks_done * chunk_size, total_pages)
+            pct = int((pages_done / max(total_pages, 1)) * 70)
             if progress_cb:
-                progress_cb(
-                    min(completed, total_pages),
-                    total_pages,
-                    f"Scanning... {min(completed, total_pages)}/{total_pages} halaman"
-                )
+                progress_cb(pct, 100,
+                    f"Scanning PDF... {pages_done}/{total_pages} halaman ({pct}%)")
+
+    save_cache(pdf_hash, page_data)
+    return page_data, False
+
+def build_output(pdf_path, page_data, invoice_list, output_path, progress_cb=None):
+    invoice_set = set(inv.upper() for inv in invoice_list)
 
     if progress_cb:
-        progress_cb(total_pages, total_pages, "Mengelompokkan faktur...")
+        progress_cb(72, 100, "Mengelompokkan bundle faktur... (72%)")
 
-    # Kumpulkan semua halaman yang punya S3M apapun (sebagai batas bundle)
-    all_s3m_pages = sorted([i for i in range(total_pages)
-                            if page_data.get(i, (None, False))[1]])
+    all_s3m_pages = sorted([int(k) for k, v in page_data.items() if len(v) > 0])
 
-    # Build invoice_pages:
-    # Untuk tiap halaman yang S3M nya ada di Excel,
-    # ambil bundle dari setelah S3M-apapun sebelumnya sampai halaman ini
+    page_invoice_map = {}
+    for k, s3m_list in page_data.items():
+        for s in s3m_list:
+            if s in invoice_set:
+                page_invoice_map[int(k)] = s
+                break
+
     invoice_pages = {}
-
     for idx, page_idx in enumerate(all_s3m_pages):
-        inv_key = page_data.get(page_idx, (None, False))[0]
+        inv_key = page_invoice_map.get(page_idx)
         if inv_key is None or inv_key not in invoice_set:
             continue
-
-        # Batas awal = setelah S3M apapun sebelumnya
         start = 0 if idx == 0 else all_s3m_pages[idx - 1] + 1
         bundle = list(range(start, page_idx + 1))
-
         if inv_key not in invoice_pages:
             invoice_pages[inv_key] = bundle
 
-    # Susun output sesuai urutan Excel
-    writer    = PdfWriter()
+    if progress_cb:
+        progress_cb(75, 100, "Menyusun output PDF... (75%)")
+
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
     found     = 0
     not_found = 0
     total     = len(invoice_list)
 
     for idx, inv in enumerate(invoice_list):
+        pct = 75 + int((idx / max(total, 1)) * 24)
         if progress_cb:
-            pct = 50 + int((idx / max(total, 1)) * 50)
-            progress_cb(pct, 100, f"Menyusun PDF... {idx+1}/{total}")
+            progress_cb(pct, 100, f"Menyusun PDF... {idx+1}/{total} ({pct}%)")
         pages = invoice_pages.get(inv.upper())
         if pages:
             for p in pages:
@@ -114,6 +145,9 @@ def scan_and_build(pdf_path, invoice_list, output_path, progress_cb=None):
             found += 1
         else:
             not_found += 1
+
+    if progress_cb:
+        progress_cb(99, 100, "Menyimpan file output... (99%)")
 
     with open(output_path, "wb") as f:
         writer.write(f)
@@ -238,20 +272,26 @@ class App(tk.Tk):
     def _card_pdf(self, parent):
         card = self._make_card(parent, "1", "File PDF Faktur Pajak")
         self.pdf_zone = self._make_upload_zone(
-            card, "📄", "Klik untuk pilih file PDF", "Format: .pdf", self._pick_pdf)
+            card, "PDF", "Klik untuk pilih file PDF", "Format: .pdf", self._pick_pdf)
 
     def _pick_pdf(self):
         path = filedialog.askopenfilename(filetypes=[("PDF Files","*.pdf")])
         if not path: return
         self.pdf_path.set(path)
         size = os.path.getsize(path) / (1024*1024)
-        self._zone_done(self.pdf_zone, "📄", os.path.basename(path),
-                        f"{size:.1f} MB · berhasil dibaca ✓")
+        pdf_hash = get_pdf_hash(path)
+        cached = load_cache(pdf_hash)
+        if cached:
+            self._zone_done(self.pdf_zone, "PDF", os.path.basename(path),
+                            f"{size:.1f} MB - Cache tersedia (scan instan)")
+        else:
+            self._zone_done(self.pdf_zone, "PDF", os.path.basename(path),
+                            f"{size:.1f} MB - Belum ada cache (akan scan pertama kali)")
 
     def _card_excel(self, parent):
         card = self._make_card(parent, "2", "Data Excel")
         self.excel_zone = self._make_upload_zone(
-            card, "📊", "Klik untuk pilih file Excel", "Format: .xlsx / .xls",
+            card, "XLS", "Klik untuk pilih file Excel", "Format: .xlsx / .xls",
             self._pick_excel)
         self.col_frame = tk.Frame(card, bg=CARDBG)
         tk.Frame(self.col_frame, bg=BORDER, height=1).pack(fill="x", pady=(4, 10))
@@ -277,8 +317,8 @@ class App(tk.Tk):
         self.excel_path.set(path)
         df = pd.read_excel(path, dtype=str)
         rows = len(df)
-        self._zone_done(self.excel_zone, "📊", os.path.basename(path),
-                        f"{rows} baris · {len(cols)} kolom terdeteksi ✓")
+        self._zone_done(self.excel_zone, "XLS", os.path.basename(path),
+                        f"{rows} baris - {len(cols)} kolom terdeteksi")
         self.col_menu["values"] = cols
         self.col_var.set(cols[0] if cols else "")
         self.col_frame.pack(fill="x")
@@ -294,7 +334,7 @@ class App(tk.Tk):
                                     highlightbackground=BORDER,
                                     highlightcolor=ACCENT)
         self._path_entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(0,8))
-        tk.Button(row, text="📁  Pilih Folder",
+        tk.Button(row, text="Pilih Folder",
                   font=("Helvetica", 11), fg=TEXT2, bg="#F3F4F6",
                   activebackground=BORDER, relief="flat", cursor="hand2",
                   padx=12, pady=6, command=self._pick_output).pack(side="left")
@@ -302,9 +342,9 @@ class App(tk.Tk):
                         highlightbackground="#BFDBFE")
         info.pack(fill="x", padx=16, pady=(0,16))
         tk.Label(info,
-                 text="ℹ️   Output hanya berisi faktur yang ada di Excel, "
-                      "diurutkan sesuai urutan Excel. Faktur multi-halaman "
-                      "otomatis dipasangkan sampai ketemu barcode S3M.",
+                 text="Output hanya berisi faktur yang ada di Excel, diurutkan "
+                      "sesuai Excel. PDF yang sudah pernah diproses akan di-cache "
+                      "otomatis sehingga proses berikutnya jauh lebih cepat.",
                  bg=INFOBG, fg=INFOFG, font=("Helvetica", 10),
                  wraplength=560, justify="left").pack(padx=12, pady=8)
 
@@ -317,7 +357,7 @@ class App(tk.Tk):
     def _btn_run(self, parent):
         self.run_btn = tk.Button(
             parent,
-            text="▲  Mulai Sortir Faktur Pajak",
+            text="Mulai Sortir Faktur Pajak",
             font=("Helvetica", 13, "bold"),
             fg="white", bg=ACCENT,
             activeforeground="white",
@@ -350,9 +390,9 @@ class App(tk.Tk):
         stats = tk.Frame(inner, bg=CARDBG)
         stats.pack(fill="x")
         stats.columnconfigure((0,1,2), weight=1, uniform="s")
-        self.stat_found    = self._stat(stats, "–", "Cocok & diurutkan", SUCCESS, 0)
-        self.stat_notfound = self._stat(stats, "–", "Tidak ditemukan",   WARN,    1)
-        self.stat_total    = self._stat(stats, "–", "Total di Excel",    MUTED,   2)
+        self.stat_found    = self._stat(stats, "-", "Cocok & diurutkan", SUCCESS, 0)
+        self.stat_notfound = self._stat(stats, "-", "Tidak ditemukan",   WARN,    1)
+        self.stat_total    = self._stat(stats, "-", "Total di Excel",    MUTED,   2)
         self._loading   = False
         self._dot_count = 0
 
@@ -372,7 +412,7 @@ class App(tk.Tk):
             self.prog_loading.config(text="")
             return
         self._dot_count = (self._dot_count + 1) % 4
-        dots = "●" * self._dot_count + "○" * (3 - self._dot_count)
+        dots = "*" * self._dot_count + "." * (3 - self._dot_count)
         self.prog_loading.config(text=dots)
         self.after(400, self._animate_dots)
 
@@ -389,12 +429,12 @@ class App(tk.Tk):
             messagebox.showwarning("Perhatian", "Pilih kolom No. Invoice."); return
         if not outd:
             messagebox.showwarning("Perhatian", "Pilih folder output terlebih dahulu."); return
-        self.run_btn.config(state="disabled", text="⏳  Sedang memproses...",
+        self.run_btn.config(state="disabled", text="Sedang memproses...",
                             bg=GRAY, fg="#E5E7EB")
         self.prog_bar["value"] = 0
-        self.stat_found.config(text="–")
-        self.stat_notfound.config(text="–")
-        self.stat_total.config(text="–")
+        self.stat_found.config(text="-")
+        self.stat_notfound.config(text="-")
+        self.stat_total.config(text="-")
         self._loading   = True
         self._dot_count = 0
         self._animate_dots()
@@ -407,50 +447,58 @@ class App(tk.Tk):
             invoice_list = extract_invoice_numbers_from_excel(excel_path, col)
             total = len(invoice_list)
             self.after(0, lambda: self.stat_total.config(text=str(total)))
+
             ts   = time.strftime("%Y%m%d_%H%M%S")
             outp = os.path.join(output_dir, f"Faktur_Sorted_{ts}.pdf")
 
-            def cb(cur, tot, msg):
-                pct = int((cur / max(tot, 1)) * 100)
-                self.after(0, lambda p=min(pct,100), m=msg: (
+            def cb(pct, _, msg):
+                self.after(0, lambda p=pct, m=msg: (
                     self.prog_bar.configure(value=p),
                     self.prog_status.configure(text=m)
                 ))
 
-            found, not_found = scan_and_build(pdf_path, invoice_list, outp, cb)
-            self.after(0, lambda: self._done(found, not_found, total, outp))
+            page_data, from_cache = scan_pdf(pdf_path, cb)
+            if from_cache:
+                cb(71, 100, "Cache loaded! Langsung matching...")
+
+            found, not_found = build_output(
+                pdf_path, page_data, invoice_list, outp, cb)
+
+            self.after(0, lambda: self._done(found, not_found, total, outp, from_cache))
         except Exception as e:
             self.after(0, lambda: self._error(str(e)))
 
     def _status(self, msg):
         self.after(0, lambda: self.prog_status.config(text=msg))
 
-    def _done(self, found, not_found, total, output_path):
+    def _done(self, found, not_found, total, output_path, from_cache):
         self._loading = False
         self.prog_bar["value"] = 100
-        self.prog_status.config(text="✅  Selesai! File PDF berhasil dibuat.")
+        cache_note = "Dari cache" if from_cache else "Cache disimpan untuk next run"
+        self.prog_status.config(text=f"Selesai! {cache_note}")
         self.prog_loading.config(text="")
         self.stat_found.config(text=str(found))
         self.stat_notfound.config(text=str(not_found))
         self.stat_total.config(text=str(total))
         self.run_btn.config(state="normal",
-                            text="▲  Mulai Sortir Faktur Pajak",
+                            text="Mulai Sortir Faktur Pajak",
                             bg=ACCENT, fg="white")
         if messagebox.askyesno("Selesai!",
-            f"✅ Faktur berhasil diurutkan!\n\n"
-            f"• Cocok & diurutkan : {found}\n"
-            f"• Tidak ditemukan   : {not_found}\n"
-            f"• Total di Excel    : {total}\n\n"
+            f"Faktur berhasil diurutkan!\n\n"
+            f"- Cocok & diurutkan : {found}\n"
+            f"- Tidak ditemukan   : {not_found}\n"
+            f"- Total di Excel    : {total}\n"
+            f"- {cache_note}\n\n"
             f"Output:\n{output_path}\n\n"
             f"Buka folder output sekarang?"):
-            os.system(f'open "{os.path.dirname(output_path)}"')
+            os.startfile(os.path.dirname(output_path))
 
     def _error(self, msg):
         self._loading = False
         self.prog_loading.config(text="")
-        self.prog_status.config(text="❌  Terjadi error.")
+        self.prog_status.config(text="Terjadi error.")
         self.run_btn.config(state="normal",
-                            text="▲  Mulai Sortir Faktur Pajak",
+                            text="Mulai Sortir Faktur Pajak",
                             bg=ACCENT, fg="white")
         messagebox.showerror("Error", f"Terjadi kesalahan:\n\n{msg}")
 
